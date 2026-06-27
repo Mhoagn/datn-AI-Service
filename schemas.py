@@ -21,3 +21,23 @@ class ProcessVideoResponse(BaseModel):
     transcript_segments: List[TranscriptSegment]
     full_text: str
     summary: str
+
+# ==========================================
+# Async Job Schemas
+# ==========================================
+
+class JobStartResponse(BaseModel):
+    job_id: str
+    status: str  # "processing"
+
+class JobResult(BaseModel):
+    status: str
+    transcript_segments: List[TranscriptSegment]
+    full_text: str
+    summary: str
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str          # "processing" | "completed" | "failed"
+    result: Optional[JobResult] = None
+    error: Optional[str] = None

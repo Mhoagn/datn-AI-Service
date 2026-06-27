@@ -8,11 +8,20 @@ from fastapi.responses import HTMLResponse
 import whisperx
 import tempfile
 import os
+import threading
+import uuid
+from typing import Dict, Any
 
 from models import model_manager
 from services import VideoProcessor, TranscriptService, SummaryService
-from schemas import ProcessVideoRequest, ProcessVideoResponse, TranscriptSegment
+from schemas import (
+    ProcessVideoRequest, ProcessVideoResponse, TranscriptSegment,
+    JobStartResponse, JobStatusResponse, JobResult
+)
 from config import HOST, PORT, WHISPER_MODEL, QWEN_MODEL, DEVICE
+
+# In-memory job store: job_id -> { status, result, error }
+_jobs: Dict[str, Dict[str, Any]] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -250,6 +259,135 @@ def health_check():
         "status": "healthy",
         "models_loaded": model_manager._models_loaded
     }
+
+# ==========================================
+# ASYNC JOB ENDPOINTS
+# Giải pháp cho vấn đề ngrok timeout (ERR_NGROK_3004):
+# Thay vì giữ connection mở suốt quá trình xử lý (5-30 phút),
+# ta start background thread và trả về job_id ngay lập tức.
+# Backend sẽ poll /job-status/{job_id} định kỳ để lấy kết quả.
+# ==========================================
+
+def _process_video_background(job_id: str, request: ProcessVideoRequest):
+    """Run video processing in a background thread"""
+    video_path = None
+    audio_path = None
+
+    try:
+        print(f"\n{'='*60}")
+        print(f"[Job {job_id}] Starting background video processing...")
+        print(f"S3: {request.s3_bucket}/{request.s3_key}")
+        print(f"{'='*60}\n")
+
+        print(f"[Job {job_id}] Step 1/4: Downloading video from S3...")
+        video_path = VideoProcessor.download_from_s3(
+            request.s3_bucket,
+            request.s3_key,
+            request.s3_region,
+            request.aws_access_key,
+            request.aws_secret_key
+        )
+
+        print(f"[Job {job_id}] Step 2/4: Extracting audio from video...")
+        audio_path = VideoProcessor.extract_audio(video_path)
+
+        print(f"[Job {job_id}] Step 3/4: Transcribing audio with WhisperX...")
+        transcript_result = TranscriptService.transcribe(audio_path)
+
+        duration_seconds = 0
+        if transcript_result["segments"]:
+            last_segment = transcript_result["segments"][-1]
+            duration_seconds = last_segment.get("end", 0)
+
+        print(f"[Job {job_id}] Duration: {duration_seconds:.1f}s ({duration_seconds/60:.1f} min)")
+
+        print(f"[Job {job_id}] Freeing GPU memory...")
+        model_manager.unload_whisper_model()
+
+        print(f"[Job {job_id}] Step 4/4: Summarizing with Qwen...")
+        summary = SummaryService.summarize(transcript_result["full_text"], duration_seconds)
+
+        segments = [TranscriptSegment(**seg) for seg in transcript_result["segments"]]
+
+        print(f"\n{'='*60}")
+        print(f"[Job {job_id}] Processing complete!")
+        print(f"Segments: {len(segments)}, Text: {len(transcript_result['full_text'])} chars")
+        print(f"{'='*60}\n")
+
+        _jobs[job_id] = {
+            "job_id": job_id,
+            "status": "completed",
+            "result": {
+                "status": "success",
+                "transcript_segments": [s.model_dump() for s in segments],
+                "full_text": transcript_result["full_text"],
+                "summary": summary,
+            },
+            "error": None,
+        }
+
+    except Exception as e:
+        import traceback
+        print(f"\n{'='*60}")
+        print(f"[Job {job_id}] ERROR: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        print(f"{'='*60}\n")
+
+        _jobs[job_id] = {
+            "job_id": job_id,
+            "status": "failed",
+            "result": None,
+            "error": str(e),
+        }
+
+    finally:
+        print(f"[Job {job_id}] Cleaning up temporary files...")
+        VideoProcessor.cleanup_files(video_path, audio_path)
+
+
+@app.post("/start-video-processing", response_model=JobStartResponse)
+async def start_video_processing(request: ProcessVideoRequest):
+    """
+    Start video processing as a background job.
+    Returns job_id immediately so the caller won't hit ngrok/proxy timeouts.
+    Use GET /job-status/{job_id} to poll for the result.
+    """
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {"job_id": job_id, "status": "processing", "result": None, "error": None}
+
+    thread = threading.Thread(
+        target=_process_video_background,
+        args=(job_id, request),
+        daemon=True,
+        name=f"ai-job-{job_id[:8]}"
+    )
+    thread.start()
+
+    print(f"[Job {job_id}] Background thread started for {request.s3_bucket}/{request.s3_key}")
+    return JobStartResponse(job_id=job_id, status="processing")
+
+
+@app.get("/job-status/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str):
+    """
+    Poll the status of an async processing job.
+    Status values: "processing" | "completed" | "failed"
+    """
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' không tồn tại")
+
+    job = _jobs[job_id]
+    result = None
+    if job["result"] is not None:
+        result = JobResult(**job["result"])
+
+    return JobStatusResponse(
+        job_id=job_id,
+        status=job["status"],
+        result=result,
+        error=job.get("error"),
+    )
+
 
 if __name__ == "__main__":
     import uvicorn
